@@ -38,6 +38,10 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     print (ml_model.model())
     print (user_input.problem_description())
     print (hw.hw_description())
+    # include short delay for demos
+    time.sleep(2)
+    # populate output
+    co2.carbon_intensity(10)
 
 # Main workflow routine
 def run():
