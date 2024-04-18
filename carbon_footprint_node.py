@@ -34,10 +34,10 @@ def signal_handler(sig, frame):
 # Inputs: ml_model, user_input, hw
 # Outputs: node_status, co2
 def task_callback(ml_model, user_input, hw, node_status, co2):
+
     # Callback implementation here
-    print (ml_model.model())
-    print (user_input.problem_description())
-    print (hw.hw_description())
+
+    co2.carbon_intensity(4)
 
 # Main workflow routine
 def run():
