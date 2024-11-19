@@ -15,6 +15,9 @@
 
 from sustainml_py.nodes.CarbonFootprintNode import CarbonFootprintNode
 
+from carbontracker.tracker import CarbonTracker
+from carbontracker import parser
+
 # Manage signaling
 import signal
 import threading
@@ -34,10 +37,34 @@ def signal_handler(sig, frame):
 # Inputs: ml_model, user_input, hw
 # Outputs: node_status, co2
 def task_callback(ml_model, user_input, hw, node_status, co2):
+    # Time to estimate Wh based on W (in hours)
+    default_time = hw.latency() / (3600 * 1000)             # ms to h
+    energy_consump = hw.power_consumption()*default_time    # W * h = Wh
+    log_directory = "/tmp/logs/carbontracker"               # temp log dir for reading carbon data results
 
-    # Callback implementation here
+    # Define CarbonTracker
+    tracker = CarbonTracker(log_dir=log_directory, epochs=1)
+    # Start measuring
+    tracker.epoch_start()
+    # Execute the training task
+    # ...
+    time.sleep(2)   # 2 seconds sleep as training (temporal approach)
+    # Stop measuring
+    tracker.epoch_end()
+    tracker.stop()
 
-    co2.carbon_intensity(4)
+    # Retrieve carbon information
+    logs = parser.parse_all_logs(log_dir=log_directory)
+    first_log = logs[0]
+    carbon = first_log['pred']['co2eq (g)']
+    intensity = 0.0
+    if energy_consump > 0:
+        intensity = carbon/energy_consump
+
+    # populate carbon footprint information
+    co2.carbon_footprint(carbon)
+    co2.energy_consumption(energy_consump)
+    co2.carbon_intensity(intensity)
 
 # Main workflow routine
 def run():
