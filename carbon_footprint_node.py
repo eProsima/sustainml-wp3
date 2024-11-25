@@ -50,16 +50,21 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     # CarbonTracker only supports Intel CPUs with the RAPL interface and NVIDIA GPUs.
     # Catch the exception, warn and populate output with default values
     try:
+        print("Starting CarbonTracker")
         # Define CarbonTracker
         tracker = CarbonTracker(log_dir=log_directory, epochs=1)
+        print("Start measuring")
          # Start measuring
         tracker.epoch_start()
         # Execute the training task
         # ...
         time.sleep(2)   # 2 seconds sleep as training (temporal approach)
         # Stop measuring
+        print("Stop ecpoch")
         tracker.epoch_end()
+        print("Stop")
         tracker.stop()
+        print("Fiish")
 
         # Retrieve carbon information
         logs = parser.parse_all_logs(log_dir=log_directory)
