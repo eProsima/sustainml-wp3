@@ -22,6 +22,7 @@ from carbontracker import parser
 import signal
 import threading
 import time
+import json
 
 # Whether to go on spinning or interrupt
 running = False
@@ -66,11 +67,30 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     co2.energy_consumption(energy_consump)
     co2.carbon_intensity(intensity)
 
+# User Configuration Callback implementation
+# Inputs: req
+# Outputs: res
+def configuration_callback(req, res):
+
+    # Callback for configuration implementation here
+
+    # Dummy JSON configuration and implementation
+    dummy_config = {
+        "param1": "value1",
+        "param2": "value2",
+        "param3": "value3"
+    }
+    res.configuration(json.dumps(dummy_config))
+    res.node_id(req.node_id())
+    res.transaction_id(req.transaction_id())
+    res.success(True)
+    res.err_code(0) # 0: No error || 1: Error
+
 # Main workflow routine
 def run():
     global running
     running = True
-    node = CarbonFootprintNode(callback=task_callback)
+    node = CarbonFootprintNode(callback=task_callback, service_callback=configuration_callback)
     node.spin()
 
 # Call main in program execution
