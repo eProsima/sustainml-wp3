@@ -115,6 +115,21 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         co2.energy_consumption(energy_consump)
         co2.carbon_intensity(intensity)
 
+        # adding number of output request to extra data
+        extra_data_bytes = user_input.extra_data()
+        extra_data_str = ''.join(chr(b) for b in extra_data_bytes)
+        extra_data_dict = json.loads(extra_data_str)
+
+        if "num_outputs" in extra_data_dict and extra_data_dict["num_outputs"] != "":
+            num_outputs = extra_data_dict["num_outputs"]
+            print(f"Number of outputs: {num_outputs}")  #debug
+            model_restrains_list = [ml_model.model()]
+            if "model_restrains" in extra_data_dict:
+                model_restrains_list.extend(extra_data_dict["model_restrains"])
+
+            encoded_data = json.dumps({"num_outputs": num_outputs, "model_restrains": model_restrains_list}).encode("utf-8")
+            co2.extra_data(encoded_data)
+
     except Exception as e:
             print(f"Error getting carbon footprint information: {e}")
 
