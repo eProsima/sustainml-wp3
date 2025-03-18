@@ -23,9 +23,40 @@ import signal
 import threading
 import time
 import json
+import multiprocessing
 
 # Whether to go on spinning or interrupt
 running = False
+
+# Create tracker on different proccess
+def create_tracker(log_dir, epochs, queue):
+    try:
+        # Define CarbonTracker
+        tracker = CarbonTracker(log_dir=log_dir, epochs=epochs)
+        # Start measuring
+        tracker.epoch_start()
+        # Execute the training task
+        # ...
+        time.sleep(2)   # 2 seconds sleep as training (temporal approach)
+        # Stop measuring
+        tracker.epoch_end()
+        tracker.stop()
+
+        # Retrieve carbon information
+        try:
+            logs = parser.parse_all_logs(log_dir=log_dir)
+        except Exception as e:
+            print("Error: ", e)
+            logs = None
+        if logs:
+            first_log = logs[0]
+            carbon = first_log['pred']['co2eq (g)']
+        else:
+            carbon = 0.0
+
+        queue.put(carbon)
+    except Exception as e:
+        queue.put(e)
 
 # Signal handler
 def signal_handler(sig, frame):
@@ -39,25 +70,41 @@ def signal_handler(sig, frame):
 # Outputs: node_status, co2
 def task_callback(ml_model, user_input, hw, node_status, co2):
     # Time to estimate Wh based on W (in hours)
-    default_time = hw.latency() / (3600 * 1000)             # ms to h
-    energy_consump = hw.power_consumption()*default_time    # W * h = Wh
+    try:
+        default_time = hw.latency() / (3600 * 1000)             # ms to h
+        energy_consump = hw.power_consumption()*default_time    # W * h = Wh
+    except Exception as e:
+        print("Error: ", e)
+        energy_consump = 0.0
+
     log_directory = "/tmp/logs/carbontracker"               # temp log dir for reading carbon data results
 
-    # Define CarbonTracker
-    tracker = CarbonTracker(log_dir=log_directory, epochs=1)
-    # Start measuring
-    tracker.epoch_start()
-    # Execute the training task
-    # ...
-    time.sleep(2)   # 2 seconds sleep as training (temporal approach)
-    # Stop measuring
-    tracker.epoch_end()
-    tracker.stop()
+    # Define CarbonTracker with fallback for no available components
+    queue = multiprocessing.Queue()
+    proc = multiprocessing.Process(target=create_tracker, args=(log_directory, 1, queue))
+    proc.start()
+    proc.join(timeout=10)
+    if proc.is_alive():
+        print("Child process did not finish within the timeout period. Terminating...")
+        proc.terminate()
+        proc.join()
+        carbon = 0.0
 
-    # Retrieve carbon information
-    logs = parser.parse_all_logs(log_dir=log_directory)
-    first_log = logs[0]
-    carbon = first_log['pred']['co2eq (g)']
+    if proc.exitcode == 70:
+        print("Warning: No hardware components available, using dummy carbon value.")
+        carbon = 0.0
+    else:
+        if not queue.empty():
+            result = queue.get()
+            if isinstance(result, Exception):
+                print("Error creating tracker:", result)
+                carbon = 0.0
+            else:
+                print("Tracker created successfully.")
+                carbon = result
+        else:
+            carbon = 0.0
+
     intensity = 0.0
     if energy_consump > 0:
         intensity = carbon/energy_consump
