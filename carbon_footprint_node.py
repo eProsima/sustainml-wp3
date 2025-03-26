@@ -80,39 +80,43 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     log_directory = "/tmp/logs/carbontracker"               # temp log dir for reading carbon data results
 
     # Define CarbonTracker with fallback for no available components
-    queue = multiprocessing.Queue()
-    proc = multiprocessing.Process(target=create_tracker, args=(log_directory, 1, queue))
-    proc.start()
-    proc.join(timeout=10)
-    if proc.is_alive():
-        print("Child process did not finish within the timeout period. Terminating...")
-        proc.terminate()
-        proc.join()
-        carbon = 0.0
-
-    if proc.exitcode == 70:
-        print("Warning: No hardware components available, using dummy carbon value.")
-        carbon = 0.0
-    else:
-        if not queue.empty():
-            result = queue.get()
-            if isinstance(result, Exception):
-                print("Error creating tracker:", result)
-                carbon = 0.0
-            else:
-                print("Tracker created successfully.")
-                carbon = result
-        else:
+    try:
+        queue = multiprocessing.Queue()
+        proc = multiprocessing.Process(target=create_tracker, args=(log_directory, 1, queue))
+        proc.start()
+        proc.join(timeout=10)
+        if proc.is_alive():
+            print("Child process did not finish within the timeout period. Terminating...")
+            proc.terminate()
+            proc.join()
             carbon = 0.0
 
-    intensity = 0.0
-    if energy_consump > 0:
-        intensity = carbon/energy_consump
+        if proc.exitcode == 70:
+            print("Warning: No hardware components available, using dummy carbon value.")
+            carbon = 0.0
+        else:
+            if not queue.empty():
+                result = queue.get()
+                if isinstance(result, Exception):
+                    print("Error creating tracker:", result)
+                    carbon = 0.0
+                else:
+                    print("Tracker created successfully.")
+                    carbon = result
+            else:
+                carbon = 0.0
 
-    # populate carbon footprint information
-    co2.carbon_footprint(carbon)
-    co2.energy_consumption(energy_consump)
-    co2.carbon_intensity(intensity)
+        intensity = 0.0
+        if energy_consump > 0:
+            intensity = carbon/energy_consump
+
+        # populate carbon footprint information
+        co2.carbon_footprint(carbon)
+        co2.energy_consumption(energy_consump)
+        co2.carbon_intensity(intensity)
+
+    except Exception as e:
+            print(f"Error getting carbon footprint information: {e}")
 
 # User Configuration Callback implementation
 # Inputs: req
