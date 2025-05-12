@@ -33,13 +33,14 @@ def create_tracker(log_dir, epochs, queue):
     try:
         # Define CarbonTracker
         tracker = CarbonTracker(log_dir=log_dir, epochs=epochs)
-        # Start measuring
-        tracker.epoch_start()
-        # Execute the training task
-        # ...
-        time.sleep(2)   # 2 seconds sleep as training (temporal approach)
-        # Stop measuring
-        tracker.epoch_end()
+        for epoch in range(epochs):
+            # Start measuring
+            tracker.epoch_start()
+            # Execute the training task
+            # ...
+            time.sleep(5)   # 5 seconds sleep as training (temporal approach) TODO
+            # Stop measuring
+            tracker.epoch_end()
         tracker.stop()
 
         # Retrieve carbon information
@@ -49,8 +50,14 @@ def create_tracker(log_dir, epochs, queue):
             print("Error: ", e)
             logs = None
         if logs:
-            first_log = logs[0]
-            carbon = first_log['pred']['co2eq (g)']
+            for entry in reversed(logs):
+                pred = entry.get("pred")
+                if pred and pred.get("co2eq (g)", 0) > 0:
+                    carbon = pred.get("co2eq (g)", 0)
+                    break
+            else:
+                carbon = 0.0
+                raise RuntimeError("No non-zero CarbonTracker entry found")
         else:
             carbon = 0.0
 
@@ -71,8 +78,8 @@ def signal_handler(sig, frame):
 def task_callback(ml_model, user_input, hw, node_status, co2):
     # Time to estimate Wh based on W (in hours)
     try:
-        default_time = hw.latency() / (3600 * 1000)             # ms to h
-        energy_consump = hw.power_consumption()*default_time    # W * h = Wh
+        default_time = hw.latency() / (3600 * 1000)             # ms to h && W to kW
+        energy_consump = hw.power_consumption()*default_time    # kW * h = kWh
     except Exception as e:
         print("Error: ", e)
         energy_consump = 0.0
