@@ -96,22 +96,20 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
             print("Child process did not finish within the timeout period. Terminating...")
             proc.terminate()
             proc.join()
-            carbon = 0.0
+            raise Exception("tracker child process did not finish within the timeout period. Terminating...")
 
         if proc.exitcode == 70:
-            print("Warning: No hardware components available, using dummy carbon value.")
-            carbon = 0.0
+            raise Exception("No hardware components available; failed to obtain carbon footprint value.")
         else:
             if not queue.empty():
                 result = queue.get()
                 if isinstance(result, Exception):
-                    print("Error creating tracker:", result)
-                    carbon = 0.0
+                    raise Exception("Error creating tracker: " + str(result))
                 else:
                     print("Tracker created successfully.")
                     carbon = result
             else:
-                carbon = 0.0
+                raise Exception("No result obtained from the tracker process; failed to obtain carbon footprint value.")
 
         intensity = 0.0
         if energy_consump > 0:
@@ -129,7 +127,6 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
 
         if "num_outputs" in extra_data_dict and extra_data_dict["num_outputs"] != "":
             num_outputs = extra_data_dict["num_outputs"]
-            print(f"Number of outputs: {num_outputs}")  #debug
             model_restrains_list = [ml_model.model()]
             if "model_restrains" in extra_data_dict:
                 model_restrains_list.extend(extra_data_dict["model_restrains"])
@@ -138,7 +135,14 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
             co2.extra_data(encoded_data)
 
     except Exception as e:
-            print(f"Error getting carbon footprint information: {e}")
+        print(f"Error getting carbon footprint information: {e}")
+        co2.carbon_footprint(0.0)
+        co2.energy_consumption(0.0)
+        co2.carbon_intensity(0.0)
+        error_message = "Failed to obtain carbon footprint information: " + str(e)
+        error_info = {"error": error_message}
+        encoded_error = json.dumps(error_info).encode("utf-8")
+        co2.extra_data(encoded_error)
 
 # User Configuration Callback implementation
 # Inputs: req
@@ -147,17 +151,14 @@ def configuration_callback(req, res):
 
     # Callback for configuration implementation here
 
-    # Dummy JSON configuration and implementation
-    dummy_config = {
-        "param1": "value1",
-        "param2": "value2",
-        "param3": "value3"
-    }
-    res.configuration(json.dumps(dummy_config))
+    # Case not supported
     res.node_id(req.node_id())
     res.transaction_id(req.transaction_id())
-    res.success(True)
-    res.err_code(0) # 0: No error || 1: Error
+    error_msg = f"Unsupported configuration request: {req.configuration()}"
+    res.configuration(json.dumps({"error": error_msg}))
+    res.success(False)
+    res.err_code(1) # 0: No error || 1: Error
+    print(error_msg)
 
 # Main workflow routine
 def run():
