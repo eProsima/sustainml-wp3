@@ -207,7 +207,12 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     # adding number of output request to extra data
     extra_data_bytes = user_input.extra_data()
     extra_data_str = ''.join(chr(b) for b in extra_data_bytes)
-    extra_data_dict = json.loads(extra_data_str)
+    try:
+        extra_data_dict = json.loads(extra_data_str)
+    except json.JSONDecodeError:
+        print("[WARN] In carbon node extra_data JSON is not valid.")
+        extra_data_dict = {}
+
 
     if "num_outputs" in extra_data_dict and extra_data_dict["num_outputs"] != "":
         num_outputs = extra_data_dict["num_outputs"]
