@@ -30,22 +30,24 @@ import torch
 # Whether to go on spinning or interrupt
 running = False
 
-def load_any_model(model_name, hf_token=None, **kwargs):
+
+# Load generic ml model and generate its input
+def load_any_model(model_name, hf_token=None, unsupported_models=None, **kwargs):
 
     model = None
 
     try:
         config = transformers.AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        print(f"Model configuration loaded: {config}")
         model_class = transformers.AutoModel._model_mapping.get(type(config), None)
 
-        if "llama" in model_class.__name__.lower() or \
-        "mistral" in model_class.__name__.lower() or \
-        "qwen" in model_class.__name__.lower() or \
-        "phi3" in model_class.__name__.lower() or \
-        "t5" in model_class.__name__.lower():
-            raise ValueError("Models that use 'llama', 'mistral', 'qwen', 'phi3' or 't5' are not supported.")
+        if unsupported_models is not None:
+            for unsupported in unsupported_models:
+                if unsupported.lower() in model_class.__name__.lower():
+                    raise ValueError(f"[WARNING] Models that use '{unsupported}' are not supported.")
+
     except Exception as e:
-        raise Exception(f"[ERROR] Could not load model {model_name} configuration: {e}")
+        raise Exception(f"[ERROR] Could not load model {model_name}: {e}")
 
     try:
         if model_class is None:
@@ -138,12 +140,14 @@ def load_any_model(model_name, hf_token=None, **kwargs):
 
     return model, tokenizer, input
 
+
 # Create tracker on different proccess
-def create_tracker(log_dir, epochs, queue, ml_model=None):
+def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=None):
     try:
         model, tokenizer, input = load_any_model(
             ml_model.model(),
             hf_token=None,
+            unsupported_models=unsupported_models,
             low_cpu_mem_usage=True,
             torch_dtype=torch.float16
         )
@@ -156,12 +160,12 @@ def create_tracker(log_dir, epochs, queue, ml_model=None):
             # Execute the training task
             # ...
             try:
-                output = model(**input)
-            except Exception as e_model:
+                model(**input)
+            except Exception:
                 if "decoder_input_ids" not in input and "input_ids" in input:
                     input["decoder_input_ids"] = input["input_ids"]
                 try:
-                    output = model(**input)
+                    model(**input)
                 except Exception as e_model2:
                     raise Exception(e_model2)
 
@@ -191,12 +195,14 @@ def create_tracker(log_dir, epochs, queue, ml_model=None):
     except Exception as e:
         queue.put(e)
 
+
 # Signal handler
 def signal_handler(sig, frame):
     print("\nExiting")
     CarbonFootprintNode.terminate()
     global running
     running = False
+
 
 # User Callback implementation
 # Inputs: ml_model, user_input, hw
@@ -223,6 +229,19 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         output_extra_data["num_outputs"]     = num_outputs
         output_extra_data["model_restrains"] = model_restrains_list
 
+    unsupported_models = None
+    extra_data_bytes = ml_model.extra_data()
+    if extra_data_bytes:
+        extra_data_str = ''.join(chr(b) for b in extra_data_bytes)
+        if extra_data_str:
+            try:
+                extra_data_dict = json.loads(extra_data_str)
+            except json.JSONDecodeError:
+                print("[WARN] In ml_model node extra_data JSON is not valid.")
+                extra_data_dict = {}
+            if "unsupported_models" in extra_data_dict:
+                unsupported_models = extra_data_dict["unsupported_models"]
+
     # Time to estimate Wh based on W (in hours)
     try:
         default_time = hw.latency() / (3600 * 1000)             # ms to h && W to kW
@@ -236,7 +255,7 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     # Define CarbonTracker with fallback for no available components
     try:
         queue = multiprocessing.Queue()
-        proc = multiprocessing.Process(target=create_tracker, args=(log_directory, 1, queue, ml_model))
+        proc = multiprocessing.Process(target=create_tracker, args=(log_directory, 1, queue, ml_model, unsupported_models))
         proc.start()
         proc.join(timeout=60)
         if proc.is_alive():
@@ -276,6 +295,7 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         output_extra_data["error"] = f"Failed to obtain carbon footprint information: {e}"
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
 
+
 # User Configuration Callback implementation
 # Inputs: req
 # Outputs: res
@@ -292,12 +312,14 @@ def configuration_callback(req, res):
     res.err_code(1) # 0: No error || 1: Error
     print(error_msg)
 
+
 # Main workflow routine
 def run():
     global running
     running = True
     node = CarbonFootprintNode(callback=task_callback, service_callback=configuration_callback)
     node.spin()
+
 
 # Call main in program execution
 if __name__ == '__main__':
