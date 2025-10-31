@@ -26,6 +26,7 @@ import json
 import multiprocessing
 import transformers
 import torch
+import os
 
 # Whether to go on spinning or interrupt
 running = False
@@ -144,6 +145,11 @@ def load_any_model(model_name, hf_token=None, unsupported_models=None, **kwargs)
 # Create tracker on different proccess
 def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=None):
     try:
+        if os.getenv("SUSTAINML_CI", "0") == "1":
+            # In CI, don't try to load/download any model. Report 0 and exit quickly.
+            queue.put(0.0)
+            return
+
         model, tokenizer, input = load_any_model(
             ml_model.model(),
             hf_token=None,
@@ -289,10 +295,24 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
 
     except Exception as e:
         print(f"Error getting carbon footprint information: {e}")
-        co2.carbon_footprint(0.0)
-        co2.energy_consumption(0.0)
-        co2.carbon_intensity(0.0)
-        output_extra_data["error"] = f"Failed to obtain carbon footprint information: {e}"
+
+        try:
+            # reuse energy_consump computed above: energy_consump = hw.power_consumption() * default_time
+            if energy_consump > 0:
+                fallback_intensity = 174.05  # gCO2/kWh (ES 2023 avg from your logs)
+                carbon = energy_consump * fallback_intensity
+                intensity = fallback_intensity
+            else:
+                carbon = 0.0
+                intensity = 0.0
+        except Exception:
+            carbon = 0.0
+            intensity = 0.0
+
+        co2.carbon_footprint(carbon)
+        co2.energy_consumption(energy_consump)
+        co2.carbon_intensity(intensity)
+        output_extra_data["error"] = f"Failed to obtain carbon footprint information: {e} (used fallback)"
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
 
 
