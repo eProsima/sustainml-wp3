@@ -19,14 +19,14 @@ from carbontracker.tracker import CarbonTracker
 from carbontracker import parser
 
 # Manage signaling
+import json
+import multiprocessing
+import os
 import signal
 import threading
 import time
-import json
-import multiprocessing
-import transformers
 import torch
-import os
+import transformers
 
 # Whether to go on spinning or interrupt
 running = False
@@ -145,11 +145,6 @@ def load_any_model(model_name, hf_token=None, unsupported_models=None, **kwargs)
 # Create tracker on different proccess
 def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=None):
     try:
-        if os.getenv("SUSTAINML_CI", "0") == "1":
-            # In CI, don't try to load/download any model. Report 0 and exit quickly.
-            queue.put(0.0)
-            return
-
         model, tokenizer, input = load_any_model(
             ml_model.model(),
             hf_token=None,
@@ -225,6 +220,9 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         print("[WARN] In carbon node extra_data JSON is not valid.")
         extra_data_dict = {}
 
+    # keep hardware/type from user extra data before we reuse extra_data_dict later
+    user_hw_required = (extra_data_dict.get("hardware_required") or "")
+    user_type = (extra_data_dict.get("type") or extra_data_dict.get("model_family") or "")
 
     if "num_outputs" in extra_data_dict and extra_data_dict["num_outputs"] != "":
         num_outputs = extra_data_dict["num_outputs"]
@@ -255,6 +253,47 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     except Exception as e:
         print("Error: ", e)
         energy_consump = 0.0
+
+    # --- ONNX/FPGA SHORT-PATH: skip HF tracker and compute CO2 from HW numbers ---
+    try:
+        model_name = ml_model.model()
+    except Exception:
+        model_name = ""
+    try:
+        model_path = ml_model.model_path()
+    except Exception:
+        model_path = ""
+
+    is_onnx = isinstance(model_path, str) and model_path.endswith(".onnx") and os.path.isfile(model_path)
+    is_fpga = isinstance(user_hw_required, str) and ("fpga" in user_hw_required.lower())
+
+    # If it's a local ONNX (our U-Net case) OR we are on FPGA, don't hit HuggingFace at all
+    if is_onnx or is_fpga:
+        # energy_consump is already in kWh (computed from W * h)
+        energy_kwh = float(energy_consump or 0.0)
+
+        # Choose a carbon intensity factor (grams CO2 per kWh). Adjust to your region if you want.
+        carbon_intensity_g_per_kwh = 233.0  # ~EU-average example
+
+        carbon_g = energy_kwh * carbon_intensity_g_per_kwh
+
+        # Populate outputs and return early
+        co2.carbon_footprint(carbon_g)                 # grams CO2e
+        co2.energy_consumption(energy_kwh)             # kWh
+        co2.carbon_intensity(carbon_intensity_g_per_kwh)  # g/kWh
+
+        # expose a bit of context for the UI/debug
+        output_extra_data.update({
+            "mode": "onnx_fpga_shortpath",
+            "model_name": model_name,
+            "model_path": model_path,
+            "hardware_required": user_hw_required,
+            "notes": "Used HW power/latency -> energy -> CO2 (no HF tracker)."
+        })
+        co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
+        return
+    # --- END ONNX/FPGA SHORT-PATH ---
+
 
     log_directory = "/tmp/logs/carbontracker"               # temp log dir for reading carbon data results
 
@@ -295,24 +334,10 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
 
     except Exception as e:
         print(f"Error getting carbon footprint information: {e}")
-
-        try:
-            # reuse energy_consump computed above: energy_consump = hw.power_consumption() * default_time
-            if energy_consump > 0:
-                fallback_intensity = 174.05  # gCO2/kWh (ES 2023 avg from your logs)
-                carbon = energy_consump * fallback_intensity
-                intensity = fallback_intensity
-            else:
-                carbon = 0.0
-                intensity = 0.0
-        except Exception:
-            carbon = 0.0
-            intensity = 0.0
-
-        co2.carbon_footprint(carbon)
-        co2.energy_consumption(energy_consump)
-        co2.carbon_intensity(intensity)
-        output_extra_data["error"] = f"Failed to obtain carbon footprint information: {e} (used fallback)"
+        co2.carbon_footprint(0.0)
+        co2.energy_consumption(0.0)
+        co2.carbon_intensity(0.0)
+        output_extra_data["error"] = f"Failed to obtain carbon footprint information: {e}"
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
 
 
