@@ -21,8 +21,6 @@ from carbontracker import parser
 # Manage signaling
 import json
 import multiprocessing
-import numpy as np
-import onnxruntime as ort
 import os
 import signal
 import threading
@@ -32,89 +30,45 @@ import transformers
 
 # Whether to go on spinning or interrupt
 running = False
+GRID_CARBON_INTENSITY = float(os.getenv("SUSTAINML_GRID_CI", "174.05"))
 
 
-# --- CarbonTracker log parser helper + debug ---
-def _parse_tracker_logs_debug(log_dir):
-    """
-    Returns (carbon_g, energy_kwh, ci_g_per_kwh), any may be None if not found.
-    Emits debug about what it read.
-    """
+# CarbonTracker log parser helper
+def _parse_tracker_logs(log_dir):
     carbon_g = None
     energy_kwh = None
     ci_g_per_kwh = None
 
     try:
-        print(f"[CT DEBUG] listing log_dir={log_dir}")
-        for p in os.listdir(log_dir):
-            print("  -", p)
-    except Exception as e:
-        print("[CT DEBUG] listdir failed:", e)
-
-    try:
         logs = parser.parse_all_logs(log_dir=log_dir)
     except Exception as e:
-        print("[CT DEBUG] parse_all_logs error:", e)
-        logs = None
-
-    if not logs:
-        print("[CT DEBUG] no logs parsed")
+        # print("[CT DEBUG] parse_all_logs error:", e)
         return carbon_g, energy_kwh, ci_g_per_kwh
 
-    # Walk from end to find the richest *non-zero* entry
-    for i, entry in enumerate(reversed(logs)):
-        pred = entry.get("pred") or {}
-        actual = entry.get("actual") or {}
+    if not logs:
+        # print("[CT DEBUG] no logs parsed")
+        return carbon_g, energy_kwh, ci_g_per_kwh
 
-        local_carbon = None
-        local_energy = None
+    # Take the last entry (the one CarbonTracker just wrote)
+    entry = logs[-1]
+    actual = entry.get("actual") or {}
+    pred   = entry.get("pred") or {}
 
-        # Try ACTUAL first, prefer non-zero
-        for k in ("co2eq (g)", "co2_eq (g)", "co2 (g)"):
-            if k in actual:
-                v = float(actual[k])
+    # Prefer ACTUAL, fall back to PRED if needed
+    def get_first(keys, d):
+        for k in keys:
+            if k in d:
+                v = float(d[k])
                 if v > 0.0:
-                    local_carbon = v
-                    break
+                    return v
+        return None
 
-        for k in ("energy (kWh)", "energy_kwh"):
-            if k in actual:
-                v = float(actual[k])
-                if v > 0.0:
-                    local_energy = v
-                    break
+    carbon_g   = get_first(("co2eq (g)",), actual) or get_first(("co2eq (g)",), pred)
+    energy_kwh = get_first(("energy (kWh)",), actual) or get_first(("energy (kWh)",), pred)
 
-        # If nothing useful in actual, try PRED
-        if local_carbon is None:
-            for k in ("co2eq (g)", "co2_eq (g)", "co2 (g)"):
-                if k in pred:
-                    v = float(pred[k])
-                    if v > 0.0:
-                        local_carbon = v
-                        break
+    if energy_kwh is not None and energy_kwh > 0.0 and carbon_g is not None:
+        ci_g_per_kwh = carbon_g / energy_kwh
 
-        if local_energy is None:
-            for k in ("energy (kWh)", "energy_kwh"):
-                if k in pred:
-                    v = float(pred[k])
-                    if v > 0.0:
-                        local_energy = v
-                        break
-
-        # Carbon intensity (gCO2/kWh) if available (field name varies) – we allow 0 here
-        if ci_g_per_kwh is None:
-            for k in ("avg_ci (gCO2/kWh)", "carbon_intensity (gCO2/kWh)", "ci (gCO2/kWh)"):
-                if k in entry:
-                    ci_g_per_kwh = float(entry[k])
-                    break
-
-        # If this entry has any non-zero carbon or energy, use it and stop
-        if (local_carbon is not None and local_carbon > 0.0) or (local_energy is not None and local_energy > 0.0):
-            carbon_g = local_carbon
-            energy_kwh = local_energy
-            break
-
-    print(f"[CT DEBUG] parsed -> carbon_g={carbon_g} energy_kwh={energy_kwh} ci_g_per_kwh={ci_g_per_kwh}")
     return carbon_g, energy_kwh, ci_g_per_kwh
 
 
@@ -265,61 +219,16 @@ def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=Non
                     iters += 1
             elapsed = time.time() - start
             tracker.epoch_end()
-            print(f"[CT DEBUG][HF] epoch={epoch} iters={iters} elapsed={elapsed:.3f}s")
 
         tracker.stop()
         time.sleep(0.3)  # allow flush
 
         # One parse + one result returned
-        carbon_g, energy_kwh, ci_g_per_kwh = _parse_tracker_logs_debug(log_dir)
+        carbon_g, _, _ = _parse_tracker_logs(log_dir)
         carbon = float(carbon_g or 0.0)
         queue.put(carbon)
-
     except Exception as e:
         print("[CT ERROR] create_tracker:", e)
-        queue.put(e)
-
-
-
-# Create tracker for ONNX models
-def create_tracker_onnx(log_dir, epochs, queue, onnx_path):
-    try:
-        print(f"[CT] ONNX tracker loading: {onnx_path}")
-
-        sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-        inputs = sess.get_inputs()
-        if not inputs:
-            raise Exception("No input tensors found in ONNX model.")
-        input_name = inputs[0].name
-        shape = inputs[0].shape
-
-        # Make a deterministic dummy input (random is fine too; doesn't matter for tracking)
-        dummy = np.random.rand(*[d if isinstance(d, int) else 1 for d in shape]).astype(np.float32)
-        print(f"[CT] Dummy input shape: {dummy.shape}")
-
-        tracker = CarbonTracker(log_dir=log_dir, epochs=epochs)
-        target_s = float(os.getenv("CT_TARGET_SECONDS", "1.0"))
-
-        for epoch in range(epochs):
-            tracker.epoch_start()
-            start = time.time()
-            iters = 0
-            while (time.time() - start) < target_s:
-                sess.run(None, {input_name: dummy})   # <-- use 'dummy' (not dummy_input)
-                iters += 1
-            elapsed = time.time() - start
-            tracker.epoch_end()
-            print(f"[CT DEBUG][ONNX] epoch={epoch} iters={iters} elapsed={elapsed:.3f}s")
-
-        tracker.stop()
-        time.sleep(0.3)
-
-        # One parse + one result returned
-        carbon_g, energy_kwh, ci_g_per_kwh = _parse_tracker_logs_debug(log_dir)
-        carbon = float(carbon_g or 0.0)
-        queue.put(carbon)
-    except Exception as e:
-        print(f"[CT ERROR] create_tracker_onnx: {e}")
         queue.put(e)
 
 
@@ -336,6 +245,7 @@ def signal_handler(sig, frame):
 # Outputs: node_status, co2
 def task_callback(ml_model, user_input, hw, node_status, co2):
 
+    global GRID_CARBON_INTENSITY
     run_tag = f"{int(time.time())}_{os.getpid()}"
     log_directory = f"/tmp/logs/carbontracker/{run_tag}"
     os.makedirs(log_directory, exist_ok=True)
@@ -350,10 +260,6 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         print("[WARN] In carbon node extra_data JSON is not valid.")
         extra_data_dict = {}
 
-    # keep hardware/type from user extra data before we reuse extra_data_dict later
-    user_hw_required = (extra_data_dict.get("hardware_required") or "")
-    user_type = (extra_data_dict.get("type") or extra_data_dict.get("model_family") or "")
-
     if "num_outputs" in extra_data_dict and extra_data_dict["num_outputs"] != "":
         num_outputs = extra_data_dict["num_outputs"]
         model_restrains_list = [ml_model.model()]
@@ -362,6 +268,28 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
 
         output_extra_data["num_outputs"]     = num_outputs
         output_extra_data["model_restrains"] = model_restrains_list
+
+    model_path = ml_model.model_path()
+    is_onnx = isinstance(model_path, str) and model_path.endswith(".onnx")
+
+    if is_onnx:
+        raw_latency = float(hw.latency())            # h
+        raw_power   = float(hw.power_consumption())  # W
+
+        energy_kwh = (raw_power * raw_latency) / 1000.0
+        carbon_g   = energy_kwh * GRID_CARBON_INTENSITY
+
+        co2.carbon_footprint(carbon_g)
+        co2.energy_consumption(energy_kwh)
+        co2.carbon_intensity(GRID_CARBON_INTENSITY)
+
+        output_extra_data["mode"] = "onnx_hw_only"
+        # Make sure num_outputs exists (fallback)
+        output_extra_data.setdefault("num_outputs", 1)
+        output_extra_data.setdefault("model_restrains", [ml_model.model()])
+
+        co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
+        return
 
     unsupported_models = None
     extra_data_bytes = ml_model.extra_data()
@@ -376,70 +304,14 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
             if "unsupported_models" in extra_data_dict:
                 unsupported_models = extra_data_dict["unsupported_models"]
 
-    # Time to estimate Wh based on W (in hours)
-    try:
-        default_time = hw.latency() / (3600 * 1000)             # ms to h && W to kW
-        energy_consump = hw.power_consumption()*default_time    # kW * h = kWh
-    except Exception as e:
-        print("Error: ", e)
-        energy_consump = 0.0
-
-    """
-    # --- ONNX/FPGA SHORT-PATH: skip HF tracker and compute CO2 from HW numbers ---
-    try:
-        model_name = ml_model.model()
-    except Exception:
-        model_name = ""
-    try:
-        model_path = ml_model.model_path()
-    except Exception:
-        model_path = ""
-
-    is_onnx = isinstance(model_path, str) and model_path.endswith(".onnx") and os.path.isfile(model_path)
-    is_fpga = isinstance(user_hw_required, str) and ("fpga" in user_hw_required.lower())
-
-    # If it's a local ONNX (our U-Net case) OR we are on FPGA, don't hit HuggingFace at all
-    if is_onnx or is_fpga:
-        # energy_consump is already in kWh (computed from W * h)
-        energy_kwh = float(energy_consump or 0.0)
-
-        # Choose a carbon intensity factor (grams CO2 per kWh). Adjust to your region if you want.
-        carbon_intensity_g_per_kwh = 233.0  # ~EU-average
-
-        carbon_g = energy_kwh * carbon_intensity_g_per_kwh
-
-        # Populate outputs and return early
-        co2.carbon_footprint(carbon_g)                 # grams CO2e
-        co2.energy_consumption(energy_kwh)             # kWh
-        co2.carbon_intensity(carbon_intensity_g_per_kwh)  # g/kWh
-
-        # expose a bit of context for the UI/debug
-        output_extra_data.update({
-            "mode": "onnx_fpga_shortpath",
-            "model_name": model_name,
-            "model_path": model_path,
-            "hardware_required": user_hw_required,
-            "notes": "Used HW power/latency -> energy -> CO2 (no HF tracker)."
-        })
-        co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
-        return
-    # --- END ONNX/FPGA SHORT-PATH ---
-    """
     #log_directory = "/tmp/logs/carbontracker"               # temp log dir for reading carbon data results
 
     # Define CarbonTracker with fallback for no available components
     try:
         queue = multiprocessing.Queue()
         ### proc = multiprocessing.Process(target=create_tracker, args=(log_directory, 1, queue, ml_model, unsupported_models))
-        model_path = ml_model.model_path()
-        is_onnx = isinstance(model_path, str) and model_path.endswith(".onnx")
 
-        if is_onnx:
-            print(f"[INFO] Running ONNX tracker for model: {model_path}")
-            proc = multiprocessing.Process(target=create_tracker_onnx, args=(log_directory, 1, queue, model_path))
-        else:
-            proc = multiprocessing.Process(target=create_tracker, args=(log_directory, 1, queue, ml_model, unsupported_models))
-
+        proc = multiprocessing.Process(target=create_tracker, args=(log_directory, 1, queue, ml_model, unsupported_models))
         proc.start()
         proc.join(timeout=60)
         if proc.is_alive():
@@ -459,26 +331,20 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
                     print("Tracker created successfully.")
                     carbon = float(result or 0.0)
 
-                    # --- Prefer tracker energy if present, else fall back to HW-based estimate ---
+                    # Prefer tracker energy if present, else fall back to HW-based estimate
                     tracker_energy_kwh = None
-                    tracker_ci_g_per_kwh = None
                     try:
-                        cg, ekwh, ci = _parse_tracker_logs_debug(log_directory)
-                        # if logs contain a more precise carbon value, prefer it
-                        if cg is not None and cg > 0:
-                            carbon = cg
+                        _, ekwh, _ = _parse_tracker_logs(log_directory)
                         tracker_energy_kwh = ekwh
-                        tracker_ci_g_per_kwh = ci
                     except Exception as e:
                         print("[CT DEBUG] could not re-parse tracker logs in task_callback:", e)
 
-                    # Compute HW-based energy in kWh from latency (ms) and power (W) as a fallback
                     try:
-                        latency_ms = hw.latency()
-                        power_w    = hw.power_consumption()
-                        # ms -> hours; W -> kW
-                        default_time_h = float(latency_ms) / (3600.0 * 1000.0)
-                        energy_consump_hw_kwh = (float(power_w) / 1000.0) * default_time_h
+                        latency_h = float(hw.latency())
+                        power_w   = float(hw.power_consumption())   # W
+
+                        # W * h = Wh → /1000 = kWh
+                        energy_consump_hw_kwh = (power_w * latency_h) / 1000.0
                     except Exception as e:
                         print("[CT DEBUG] HW energy compute failed:", e)
                         energy_consump_hw_kwh = 0.0
@@ -486,40 +352,34 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
                     # Choose energy source (per-epoch/second energy)
                     if tracker_energy_kwh is not None and tracker_energy_kwh > 0:
                         energy_consump = tracker_energy_kwh
-                        print(f"[CT DEBUG] Using TRACKER energy: {energy_consump:.9f} kWh")
                     else:
                         energy_consump = energy_consump_hw_kwh
-                        print(f"[CT DEBUG] Using HW-estimated energy: {energy_consump:.9f} kWh (latency_ms={latency_ms}, power_w={power_w})")
 
-                    # --- Convert epoch-based values to per-inference values (approximate) ---
+                    # Convert epoch-based values to per-inference values (approximate)
                     try:
                         epoch_s = float(os.getenv("CT_TARGET_SECONDS", "1.0"))
-                        latency_ms = hw.latency()
-                        latency_s = float(latency_ms) / 1000.0
+                        latency_h = float(hw.latency())        # hours per inference
+                        latency_s = latency_h * 3600.0         # convert to seconds
 
                         if epoch_s > 0.0 and latency_s > 0.0:
                             inf_per_epoch = epoch_s / latency_s
                             if inf_per_epoch > 0.0:
                                 carbon = carbon / inf_per_epoch
                                 energy_consump = energy_consump / inf_per_epoch
-                                print(
-                                    f"[CT DEBUG] per-inference metrics: "
-                                    f"carbon_g={carbon:.9f}, energy_kwh={energy_consump:.9f}, "
-                                    f"approx_inf_per_epoch={inf_per_epoch:.2f}"
-                                )
+                                # print(f"[CT DEBUG] per-inference metrics: "f"carbon_g={carbon:.9f}, energy_kwh={energy_consump:.9f}, "f"approx_inf_per_epoch={inf_per_epoch:.2f}")
                             else:
                                 print("[CT DEBUG] inf_per_epoch <= 0, skipping per-inference scaling")
                         else:
                             print("[CT DEBUG] epoch_s or latency_s <= 0, skipping per-inference scaling")
                     except Exception as e:
                         print("[CT DEBUG] per-inference scaling failed:", e)
-
             else:
                 raise Exception("No result obtained from the tracker process; failed to obtain carbon footprint value.")
 
         intensity = 0.0
         if energy_consump > 0:
             intensity = carbon/energy_consump
+            GRID_CARBON_INTENSITY = intensity  # Update global for consistency
 
         # populate carbon footprint information
         co2.carbon_footprint(carbon)
