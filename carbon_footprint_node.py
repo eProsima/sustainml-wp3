@@ -30,7 +30,7 @@ import transformers
 
 # Whether to go on spinning or interrupt
 running = False
-GRID_CARBON_INTENSITY = float(os.getenv("SUSTAINML_GRID_CI", "174.05"))
+GRID_CARBON_INTENSITY = float(os.getenv("SUSTAINML_GRID_CI", "0"))
 
 
 # CarbonTracker log parser helper
@@ -109,6 +109,7 @@ def load_any_model(model_name, hf_token=None, unsupported_models=None, **kwargs)
         ("Processor", transformers.AutoProcessor, {})
     ]
 
+    last_tok_err = None
     for label, token_class, extra_args in available_token_classes:
         try:
             tokenizer = token_class.from_pretrained(
@@ -117,9 +118,16 @@ def load_any_model(model_name, hf_token=None, unsupported_models=None, **kwargs)
                 trust_remote_code=True,
                 **{**extra_args, **kwargs}
             )
+            last_tok_err = None
             break
-        except Exception as e:
+        except Exception as err:
+            last_tok_err = err
             tokenizer = None
+
+    if tokenizer is None:
+        raise Exception(
+            f"Error initializing tokenizer for model {model_name}: {last_tok_err}"
+        ) from last_tok_err
 
     if tokenizer is None:
         raise Exception(f"Error initializing tokenizer for model {model_name}: {e}")
@@ -228,8 +236,13 @@ def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=Non
         carbon = float(carbon_g or 0.0)
         queue.put(carbon)
     except Exception as e:
-        print("[CT ERROR] create_tracker:", e)
-        queue.put(e)
+        import traceback
+        tb = traceback.format_exc()
+        print("[CT ERROR] create_tracker:", repr(e), "\n", tb, flush=True)
+        try:
+            queue.put(RuntimeError(repr(e)))
+        except Exception:
+            pass
 
 
 # Signal handler
@@ -309,6 +322,36 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     is_onnx = isinstance(model_path, str) and model_path.endswith(".onnx")
 
     if is_onnx:
+        global GRID_CARBON_INTENSITY
+
+        # Calibrate GRID_CARBON_INTENSITY if not set
+        if (not os.getenv("SUSTAINML_GRID_CI")) and (not GRID_CARBON_INTENSITY or GRID_CARBON_INTENSITY <= 0):
+            try:
+                run_tag = f"ci_calib_{int(time.time())}_{os.getpid()}"
+                calib_log_dir = f"/tmp/logs/carbontracker/{run_tag}"
+                os.makedirs(calib_log_dir, exist_ok=True)
+
+                tracker = CarbonTracker(log_dir=calib_log_dir, epochs=1)
+                tracker.epoch_start()
+
+                t0 = time.time()
+                while time.time() - t0 < 0.5:
+                    _ = (torch.rand(256, 256) @ torch.rand(256, 256)).sum().item()
+
+                tracker.epoch_end()
+                tracker.stop()
+                time.sleep(0.2)
+
+                _, _, ci = _parse_tracker_logs(calib_log_dir)
+                if ci is not None and ci > 0:
+                    GRID_CARBON_INTENSITY = float(ci)
+                else:
+                    # Fallback if calibration didn't yield a CI
+                    GRID_CARBON_INTENSITY = 0.0
+            except Exception as e:
+                print(f"[WARN] CI calibration failed; using fallback. Reason: {e}")
+                GRID_CARBON_INTENSITY = 0.0
+
         raw_latency = float(hw.latency())            # h
         raw_power   = float(hw.power_consumption())  # W
 
@@ -320,6 +363,7 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         co2.carbon_intensity(GRID_CARBON_INTENSITY)
 
         output_extra_data["mode"] = "onnx_hw_only"
+        output_extra_data["grid_ci_source"] = "env" if os.getenv("SUSTAINML_GRID_CI") else "calibrated_or_fallback"
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
         return
 
@@ -346,7 +390,8 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
             args=(log_directory, 1, queue, ml_model, unsupported_models)
         )
         proc.start()
-        proc.join(timeout=60)
+        proc.join(timeout=75)
+        print("[CT DEBUG] child alive?", proc.is_alive(), "exitcode=", proc.exitcode, "queue_empty=", queue.empty(), flush=True)
         if proc.is_alive():
             print("Child process did not finish within the timeout period. Terminating...")
             proc.terminate()
