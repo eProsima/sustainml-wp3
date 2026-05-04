@@ -19,16 +19,57 @@ from carbontracker.tracker import CarbonTracker
 from carbontracker import parser
 
 # Manage signaling
+import json
+import multiprocessing
+import os
 import signal
 import threading
 import time
-import json
-import multiprocessing
-import transformers
 import torch
+import transformers
 
 # Whether to go on spinning or interrupt
 running = False
+GRID_CARBON_INTENSITY = float(os.getenv("SUSTAINML_GRID_CI", "0"))
+
+
+# CarbonTracker log parser helper
+def _parse_tracker_logs(log_dir):
+    carbon_g = None
+    energy_kwh = None
+    ci_g_per_kwh = None
+
+    try:
+        logs = parser.parse_all_logs(log_dir=log_dir)
+    except Exception as e:
+        # print("[CT DEBUG] parse_all_logs error:", e)
+        return carbon_g, energy_kwh, ci_g_per_kwh
+
+    if not logs:
+        # print("[CT DEBUG] no logs parsed")
+        return carbon_g, energy_kwh, ci_g_per_kwh
+
+    # Take the last entry (the one CarbonTracker just wrote)
+    entry = logs[-1]
+    actual = entry.get("actual") or {}
+    pred   = entry.get("pred") or {}
+
+    # Prefer ACTUAL, fall back to PRED if needed
+    def get_first(keys, d):
+        for k in keys:
+            if k in d:
+                v = float(d[k])
+                if v > 0.0:
+                    return v
+        return None
+
+    carbon_g   = get_first(("co2eq (g)",), actual) or get_first(("co2eq (g)",), pred)
+    energy_kwh = get_first(("energy (kWh)",), actual) or get_first(("energy (kWh)",), pred)
+
+    if energy_kwh is not None and energy_kwh > 0.0 and carbon_g is not None:
+        ci_g_per_kwh = carbon_g / energy_kwh
+
+    return carbon_g, energy_kwh, ci_g_per_kwh
 
 
 # Load generic ml model and generate its input
@@ -68,6 +109,7 @@ def load_any_model(model_name, hf_token=None, unsupported_models=None, **kwargs)
         ("Processor", transformers.AutoProcessor, {})
     ]
 
+    last_tok_err = None
     for label, token_class, extra_args in available_token_classes:
         try:
             tokenizer = token_class.from_pretrained(
@@ -76,9 +118,16 @@ def load_any_model(model_name, hf_token=None, unsupported_models=None, **kwargs)
                 trust_remote_code=True,
                 **{**extra_args, **kwargs}
             )
+            last_tok_err = None
             break
-        except Exception as e:
+        except Exception as err:
+            last_tok_err = err
             tokenizer = None
+
+    if tokenizer is None:
+        raise Exception(
+            f"Error initializing tokenizer for model {model_name}: {last_tok_err}"
+        ) from last_tok_err
 
     if tokenizer is None:
         raise Exception(f"Error initializing tokenizer for model {model_name}: {e}")
@@ -151,49 +200,49 @@ def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=Non
             low_cpu_mem_usage=True,
             torch_dtype=torch.float16
         )
-        print(f"Model {ml_model.model()} loaded successfully.")
-        # Define CarbonTracker
+        print(f"[CT] HF model loaded for tracker: {ml_model.model()}")
+
+        # No-grad / eval for consistent forwards
+        if hasattr(model, "eval"):
+            model.eval()
+
         tracker = CarbonTracker(log_dir=log_dir, epochs=epochs)
+
+        # Window of real work per epoch (seconds). Tunable via env.
+        target_s = float(os.getenv("CT_TARGET_SECONDS", "1.0"))
+
         for epoch in range(epochs):
-            # Start measuring
             tracker.epoch_start()
-            # Execute the training task
-            # ...
-            try:
-                model(**input)
-            except Exception:
-                if "decoder_input_ids" not in input and "input_ids" in input:
-                    input["decoder_input_ids"] = input["input_ids"]
-                try:
-                    model(**input)
-                except Exception as e_model2:
-                    raise Exception(e_model2)
-
-            # Stop measuring
+            start = time.time()
+            iters = 0
+            with torch.inference_mode():
+                while (time.time() - start) < target_s:
+                    try:
+                        model(**input)
+                    except Exception:
+                        # fallback for encoder-decoder models
+                        if "decoder_input_ids" not in input and "input_ids" in input:
+                            input["decoder_input_ids"] = input["input_ids"]
+                        model(**input)
+                    iters += 1
+            elapsed = time.time() - start
             tracker.epoch_end()
+
         tracker.stop()
+        time.sleep(0.3)  # allow flush
 
-        # Retrieve carbon information
-        try:
-            logs = parser.parse_all_logs(log_dir=log_dir)
-        except Exception as e:
-            print("Error: ", e)
-            logs = None
-        if logs:
-            for entry in reversed(logs):
-                pred = entry.get("pred")
-                if pred and pred.get("co2eq (g)", 0) > 0:
-                    carbon = pred.get("co2eq (g)", 0)
-                    break
-            else:
-                carbon = 0.0
-                raise RuntimeError("No non-zero CarbonTracker entry found")
-        else:
-            carbon = 0.0
-
+        # One parse + one result returned
+        carbon_g, _, _ = _parse_tracker_logs(log_dir)
+        carbon = float(carbon_g or 0.0)
         queue.put(carbon)
     except Exception as e:
-        queue.put(e)
+        import traceback
+        tb = traceback.format_exc()
+        print("[CT ERROR] create_tracker:", repr(e), "\n", tb, flush=True)
+        try:
+            queue.put(RuntimeError(repr(e)))
+        except Exception:
+            pass
 
 
 # Signal handler
@@ -209,55 +258,140 @@ def signal_handler(sig, frame):
 # Outputs: node_status, co2
 def task_callback(ml_model, user_input, hw, node_status, co2):
 
-    output_extra_data = {}
-    # adding number of output request to extra data
+    global GRID_CARBON_INTENSITY
+    run_tag = f"{int(time.time())}_{os.getpid()}"
+    log_directory = f"/tmp/logs/carbontracker/{run_tag}"
+    os.makedirs(log_directory, exist_ok=True)
+
+    # Safe default extra_data, always defined always sent
+    model_name = ml_model.model()
+    if isinstance(model_name, (bytes, bytearray, list, tuple)):
+        try:
+            model_name = ''.join(chr(b) for b in model_name)
+        except Exception:
+            model_name = str(model_name)
+
+    output_extra_data = {
+        "num_outputs": 1,
+        "model_restrains": [model_name],
+    }
+
+    # Read user_input.extra_data() to refine num_outputs / restrains
     extra_data_bytes = user_input.extra_data()
-    extra_data_str = ''.join(chr(b) for b in extra_data_bytes)
-    try:
-        extra_data_dict = json.loads(extra_data_str)
-    except json.JSONDecodeError:
-        print("[WARN] In carbon node extra_data JSON is not valid.")
-        extra_data_dict = {}
+    user_extra = {}
+    if extra_data_bytes:
+        try:
+            extra_data_str = ''.join(chr(b) for b in extra_data_bytes)
+            if extra_data_str:
+                user_extra = json.loads(extra_data_str)
+        except json.JSONDecodeError:
+            print("[WARN] In carbon node extra_data JSON is not valid.")
+            user_extra = {}
 
+    if "num_outputs" in user_extra and user_extra["num_outputs"] != "":
+        output_extra_data["num_outputs"] = user_extra["num_outputs"]
 
-    if "num_outputs" in extra_data_dict and extra_data_dict["num_outputs"] != "":
-        num_outputs = extra_data_dict["num_outputs"]
-        model_restrains_list = [ml_model.model()]
-        if "model_restrains" in extra_data_dict:
-            model_restrains_list.extend(extra_data_dict["model_restrains"])
+    if "model_restrains" in user_extra:
+        lst = [model_name] + list(user_extra["model_restrains"])
+        seen = set()
+        merged = []
+        for m in lst:
+            if m not in seen:
+                merged.append(m)
+                seen.add(m)
+        output_extra_data["model_restrains"] = merged
 
-        output_extra_data["num_outputs"]     = num_outputs
-        output_extra_data["model_restrains"] = model_restrains_list
+    # NO_MODEL → early exit (zeros, safe extra_data, NO CRASH)
+    if str(model_name).upper() == "NO_MODEL":
+        print(f"[INFO][carbon] Skipping carbon estimation: no model selected for this task ({model_name}).")
 
+        co2.carbon_footprint(0.0)
+        co2.energy_consumption(0.0)
+        co2.carbon_intensity(0.0)
+
+        output_extra_data.update({
+            "mode": "no_model",
+            "error": "No model selected (NO_MODEL). Carbon footprint not computed."
+        })
+
+        co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
+        return
+
+    # ONNX path (FPGA / RPTU) → use HW latency & power only
+    model_path = ml_model.model_path()
+    is_onnx = isinstance(model_path, str) and model_path.endswith(".onnx")
+
+    if is_onnx:
+        global GRID_CARBON_INTENSITY
+
+        # Calibrate GRID_CARBON_INTENSITY if not set
+        if (not os.getenv("SUSTAINML_GRID_CI")) and (not GRID_CARBON_INTENSITY or GRID_CARBON_INTENSITY <= 0):
+            try:
+                run_tag = f"ci_calib_{int(time.time())}_{os.getpid()}"
+                calib_log_dir = f"/tmp/logs/carbontracker/{run_tag}"
+                os.makedirs(calib_log_dir, exist_ok=True)
+
+                tracker = CarbonTracker(log_dir=calib_log_dir, epochs=1)
+                tracker.epoch_start()
+
+                t0 = time.time()
+                while time.time() - t0 < 0.5:
+                    _ = (torch.rand(256, 256) @ torch.rand(256, 256)).sum().item()
+
+                tracker.epoch_end()
+                tracker.stop()
+                time.sleep(0.2)
+
+                _, _, ci = _parse_tracker_logs(calib_log_dir)
+                if ci is not None and ci > 0:
+                    GRID_CARBON_INTENSITY = float(ci)
+                else:
+                    # Fallback if calibration didn't yield a CI
+                    GRID_CARBON_INTENSITY = 0.0
+            except Exception as e:
+                print(f"[WARN] CI calibration failed; using fallback. Reason: {e}")
+                GRID_CARBON_INTENSITY = 0.0
+
+        raw_latency = float(hw.latency())            # h
+        raw_power   = float(hw.power_consumption())  # W
+
+        energy_kwh = (raw_power * raw_latency) / 1000.0
+        carbon_g   = energy_kwh * GRID_CARBON_INTENSITY
+
+        co2.carbon_footprint(carbon_g)
+        co2.energy_consumption(energy_kwh)
+        co2.carbon_intensity(GRID_CARBON_INTENSITY)
+
+        output_extra_data["mode"] = "onnx_hw_only"
+        output_extra_data["grid_ci_source"] = "env" if os.getenv("SUSTAINML_GRID_CI") else "calibrated_or_fallback"
+        co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
+        return
+
+    # HF / CarbonTracker path (non-ONNX models)
     unsupported_models = None
     extra_data_bytes = ml_model.extra_data()
     if extra_data_bytes:
-        extra_data_str = ''.join(chr(b) for b in extra_data_bytes)
-        if extra_data_str:
-            try:
-                extra_data_dict = json.loads(extra_data_str)
-            except json.JSONDecodeError:
-                print("[WARN] In ml_model node extra_data JSON is not valid.")
-                extra_data_dict = {}
-            if "unsupported_models" in extra_data_dict:
-                unsupported_models = extra_data_dict["unsupported_models"]
+        try:
+            extra_data_str = ''.join(chr(b) for b in extra_data_bytes)
+            if extra_data_str:
+                md = json.loads(extra_data_str)
+            else:
+                md = {}
+        except json.JSONDecodeError:
+            print("[WARN] In ml_model node extra_data JSON is not valid.")
+            md = {}
+        if "unsupported_models" in md:
+            unsupported_models = md["unsupported_models"]
 
-    # Time to estimate Wh based on W (in hours)
-    try:
-        default_time = hw.latency() / (3600 * 1000)             # ms to h && W to kW
-        energy_consump = hw.power_consumption()*default_time    # kW * h = kWh
-    except Exception as e:
-        print("Error: ", e)
-        energy_consump = 0.0
-
-    log_directory = "/tmp/logs/carbontracker"               # temp log dir for reading carbon data results
-
-    # Define CarbonTracker with fallback for no available components
     try:
         queue = multiprocessing.Queue()
-        proc = multiprocessing.Process(target=create_tracker, args=(log_directory, 1, queue, ml_model, unsupported_models))
+        proc = multiprocessing.Process(
+            target=create_tracker,
+            args=(log_directory, 1, queue, ml_model, unsupported_models)
+        )
         proc.start()
-        proc.join(timeout=60)
+        proc.join(timeout=75)
+        print("[CT DEBUG] child alive?", proc.is_alive(), "exitcode=", proc.exitcode, "queue_empty=", queue.empty(), flush=True)
         if proc.is_alive():
             print("Child process did not finish within the timeout period. Terminating...")
             proc.terminate()
@@ -273,18 +407,62 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
                     raise Exception("Error creating tracker: " + str(result))
                 else:
                     print("Tracker created successfully.")
-                    carbon = result
+                    carbon = float(result or 0.0)
+
+                    # Try to get energy from tracker logs
+                    tracker_energy_kwh = None
+                    try:
+                        _, ekwh, _ = _parse_tracker_logs(log_directory)
+                        tracker_energy_kwh = ekwh
+                    except Exception as e:
+                        print("[CT DEBUG] could not re-parse tracker logs in task_callback:", e)
+
+                    try:
+                        latency_h = float(hw.latency())
+                        power_w   = float(hw.power_consumption())   # W
+
+                        # W * h = Wh → /1000 = kWh
+                        energy_consump_hw_kwh = (power_w * latency_h) / 1000.0
+                    except Exception as e:
+                        print("[CT DEBUG] HW energy compute failed:", e)
+                        energy_consump_hw_kwh = 0.0
+
+                    # Choose energy source
+                    if tracker_energy_kwh is not None and tracker_energy_kwh > 0:
+                        energy_consump = tracker_energy_kwh
+                    else:
+                        energy_consump = energy_consump_hw_kwh
+
+                    # Scale to per-inference
+                    try:
+                        epoch_s = float(os.getenv("CT_TARGET_SECONDS", "1.0"))
+                        latency_h = float(hw.latency())        # hours per inference
+                        latency_s = latency_h * 3600.0         # convert to seconds
+
+                        if epoch_s > 0.0 and latency_s > 0.0:
+                            inf_per_epoch = epoch_s / latency_s
+                            if inf_per_epoch > 0.0:
+                                carbon = carbon / inf_per_epoch
+                                energy_consump = energy_consump / inf_per_epoch
+                            else:
+                                print("[CT DEBUG] inf_per_epoch <= 0, skipping per-inference scaling")
+                        else:
+                            print("[CT DEBUG] epoch_s or latency_s <= 0, skipping per-inference scaling")
+                    except Exception as e:
+                        print("[CT DEBUG] per-inference scaling failed:", e)
             else:
                 raise Exception("No result obtained from the tracker process; failed to obtain carbon footprint value.")
 
         intensity = 0.0
         if energy_consump > 0:
-            intensity = carbon/energy_consump
+            intensity = carbon / energy_consump
+            GRID_CARBON_INTENSITY = intensity  # Update global
 
-        # populate carbon footprint information
         co2.carbon_footprint(carbon)
         co2.energy_consumption(energy_consump)
         co2.carbon_intensity(intensity)
+
+        output_extra_data["mode"] = "tracker"
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
 
     except Exception as e:
@@ -292,7 +470,11 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         co2.carbon_footprint(0.0)
         co2.energy_consumption(0.0)
         co2.carbon_intensity(0.0)
-        output_extra_data["error"] = f"Failed to obtain carbon footprint information: {e}"
+
+        output_extra_data.update({
+            "mode": "error",
+            "error": f"Failed to obtain carbon footprint information: {e}"
+        })
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
 
 
