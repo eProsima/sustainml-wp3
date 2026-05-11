@@ -42,11 +42,9 @@ def _parse_tracker_logs(log_dir):
     try:
         logs = parser.parse_all_logs(log_dir=log_dir)
     except Exception as e:
-        # print("[CT DEBUG] parse_all_logs error:", e)
         return carbon_g, energy_kwh, ci_g_per_kwh
 
     if not logs:
-        # print("[CT DEBUG] no logs parsed")
         return carbon_g, energy_kwh, ci_g_per_kwh
 
     # Take the last entry (the one CarbonTracker just wrote)
@@ -79,7 +77,6 @@ def load_any_model(model_name, hf_token=None, unsupported_models=None, **kwargs)
 
     try:
         config = transformers.AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-        print(f"Model configuration loaded: {config}")
         model_class = transformers.AutoModel._model_mapping.get(type(config), None)
 
         if unsupported_models is not None:
@@ -128,9 +125,6 @@ def load_any_model(model_name, hf_token=None, unsupported_models=None, **kwargs)
         raise Exception(
             f"Error initializing tokenizer for model {model_name}: {last_tok_err}"
         ) from last_tok_err
-
-    if tokenizer is None:
-        raise Exception(f"Error initializing tokenizer for model {model_name}: {e}")
 
     input = None
     try:
@@ -322,7 +316,6 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     is_onnx = isinstance(model_path, str) and model_path.endswith(".onnx")
 
     if is_onnx:
-        global GRID_CARBON_INTENSITY
 
         # Calibrate GRID_CARBON_INTENSITY if not set
         if (not os.getenv("SUSTAINML_GRID_CI")) and (not GRID_CARBON_INTENSITY or GRID_CARBON_INTENSITY <= 0):
@@ -391,7 +384,6 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         )
         proc.start()
         proc.join(timeout=75)
-        print("[CT DEBUG] child alive?", proc.is_alive(), "exitcode=", proc.exitcode, "queue_empty=", queue.empty(), flush=True)
         if proc.is_alive():
             print("Child process did not finish within the timeout period. Terminating...")
             proc.terminate()
@@ -415,7 +407,7 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
                         _, ekwh, _ = _parse_tracker_logs(log_directory)
                         tracker_energy_kwh = ekwh
                     except Exception as e:
-                        print("[CT DEBUG] could not re-parse tracker logs in task_callback:", e)
+                        print("Could not re-parse tracker logs in task_callback:", e)
 
                     try:
                         latency_h = float(hw.latency())
@@ -424,7 +416,7 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
                         # W * h = Wh → /1000 = kWh
                         energy_consump_hw_kwh = (power_w * latency_h) / 1000.0
                     except Exception as e:
-                        print("[CT DEBUG] HW energy compute failed:", e)
+                        print("HW energy compute failed:", e)
                         energy_consump_hw_kwh = 0.0
 
                     # Choose energy source
@@ -445,11 +437,11 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
                                 carbon = carbon / inf_per_epoch
                                 energy_consump = energy_consump / inf_per_epoch
                             else:
-                                print("[CT DEBUG] inf_per_epoch <= 0, skipping per-inference scaling")
+                                print("inf_per_epoch <= 0, skipping per-inference scaling")
                         else:
-                            print("[CT DEBUG] epoch_s or latency_s <= 0, skipping per-inference scaling")
+                            print("epoch_s or latency_s <= 0, skipping per-inference scaling")
                     except Exception as e:
-                        print("[CT DEBUG] per-inference scaling failed:", e)
+                        print("Per-inference scaling failed:", e)
             else:
                 raise Exception("No result obtained from the tracker process; failed to obtain carbon footprint value.")
 
