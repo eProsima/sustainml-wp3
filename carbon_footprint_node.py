@@ -19,6 +19,7 @@ from carbontracker.tracker import CarbonTracker
 from carbontracker import parser
 
 # Manage signaling
+import csv
 import json
 import multiprocessing
 import os
@@ -30,7 +31,77 @@ import transformers
 
 # Whether to go on spinning or interrupt
 running = False
-GRID_CARBON_INTENSITY = float(os.getenv("SUSTAINML_GRID_CI", "0"))
+COUNTRY_INTENSITIES = None
+DETECTED_COUNTRY = None
+# Seconds the model runs while CarbonTracker measures it. CarbonTracker reads the power once per
+# second, so a 1 s run could end before its second reading and measure nothing
+CT_TARGET_SECONDS = float(os.getenv("CT_TARGET_SECONDS", "3"))
+AUTO_MAX_ATTEMPTS = 3  # Models tried per output by the auto carbon footprint optimization
+
+
+# Latest yearly grid intensity (gCO2/kWh) of an ISO alpha-2 country, from carbon_intensities.csv
+# (Our World in Data; regenerate it with update_carbon_intensities.py)
+def _country_intensity(country_code):
+    global COUNTRY_INTENSITIES
+    if COUNTRY_INTENSITIES is None:
+        COUNTRY_INTENSITIES = {}
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "carbon_intensities.csv")
+        try:
+            with open(path, newline="") as f:
+                for row in csv.DictReader(f):
+                    COUNTRY_INTENSITIES[row["alpha-2"].upper()] = (
+                        float(row["Carbon intensity of electricity (gCO2/kWh)"]), row["Entity"], row["Year"])
+        except Exception as e:
+            print(f"[WARN][carbon] Could not read country carbon intensities from {path}: {e}")
+    return COUNTRY_INTENSITIES.get((country_code or "").strip().upper())
+
+
+# ISO alpha-2 code of the country of this machine's public IP address (None if it cannot be
+# detected; only a detected country is kept, so a failure is retried on the next task)
+def _detect_country():
+    global DETECTED_COUNTRY
+    if DETECTED_COUNTRY is None:
+        try:
+            import geocoder
+            location = geocoder.ip("me")
+            if location.ok and location.country:
+                DETECTED_COUNTRY = location.country
+        except Exception as e:
+            print(f"[WARN][carbon] Could not detect the country from the IP address: {e}")
+    return DETECTED_COUNTRY
+
+
+# Grid intensity to use, as (gCO2/kWh, name, year, how it was chosen): the country chosen by the
+# user; else the country detected from the IP address; else, when that is unknown or not in the
+# table, the world average. None only if the table is missing.
+def _grid_intensity(country_code):
+    chosen = _country_intensity(country_code)
+    if chosen is not None:
+        return chosen + ("chosen in SustainML",)
+    detected = _country_intensity(_detect_country())
+    if detected is not None:
+        return detected + ("detected from the IP address",)
+    world = _country_intensity("WORLD")
+    if world is not None:
+        return world + ("country unknown or not in the list",)
+    return None
+
+
+# Auto carbon footprint optimization: whether the model just measured misses the desired carbon
+# footprint or the max memory footprint (or could not be measured, carbon_g None), so the
+# orchestrator must discard it and search again
+def _auto_reiterate(user_input, user_extra, hw, carbon_g):
+    if not user_input.optimize_carbon_footprint_auto() or user_extra.get("model_selected"):
+        return False
+    if int(user_extra.get("auto_attempt") or 1) >= AUTO_MAX_ATTEMPTS:
+        return False
+    if carbon_g is None:
+        return True
+    desired = float(user_input.desired_carbon_footprint() or 0.0)
+    max_memory = float(user_extra.get("max_memory_footprint") or 0.0)
+    carbon_exceeded = desired > 0.0 and carbon_g > desired
+    memory_exceeded = max_memory > 0.0 and float(hw.memory_footprint_of_ml_model()) > max_memory
+    return carbon_exceeded or memory_exceeded
 
 
 # CarbonTracker log parser helper
@@ -184,9 +255,27 @@ def load_any_model(model_name, hf_token=None, unsupported_models=None, **kwargs)
     return model, tokenizer, input
 
 
+# Make CarbonTracker use the grid intensity from _grid_intensity instead of looking up its own for
+# this machine's location (and warning that it could not fetch a live value for it)
+def _use_grid_intensity(geo):
+    from carbontracker.emissions.intensity import intensity as ct_intensity
+
+    def carbon_intensity(logger, time_dur=None, fetchers=None):
+        return ct_intensity.CarbonIntensity(
+            carbon_intensity=geo[0],
+            address=f"{geo[1]} ({geo[3]})",
+            message=f"Using the average carbon intensity of {geo[1]} in {geo[2]}: {geo[0]} gCO2/kWh.",
+            success=True,
+            is_prediction=time_dur is not None)
+
+    ct_intensity.carbon_intensity = carbon_intensity
+
+
 # Create tracker on different proccess
-def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=None):
+def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=None, geo=None):
     try:
+        if geo is not None:
+            _use_grid_intensity(geo)
         model, tokenizer, input = load_any_model(
             ml_model.model(),
             hf_token=None,
@@ -202,8 +291,8 @@ def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=Non
 
         tracker = CarbonTracker(log_dir=log_dir, epochs=epochs)
 
-        # Window of real work per epoch (seconds). Tunable via env.
-        target_s = float(os.getenv("CT_TARGET_SECONDS", "1.0"))
+        # Window of real work per epoch (seconds)
+        target_s = CT_TARGET_SECONDS
 
         for epoch in range(epochs):
             tracker.epoch_start()
@@ -225,10 +314,9 @@ def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=Non
         tracker.stop()
         time.sleep(0.3)  # allow flush
 
-        # One parse + one result returned
-        carbon_g, _, _ = _parse_tracker_logs(log_dir)
-        carbon = float(carbon_g or 0.0)
-        queue.put(carbon)
+        # How long the model actually ran (the last inference ends after target_s): the energy
+        # CarbonTracker logged is for that time
+        queue.put(elapsed)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -252,7 +340,6 @@ def signal_handler(sig, frame):
 # Outputs: node_status, co2
 def task_callback(ml_model, user_input, hw, node_status, co2):
 
-    global GRID_CARBON_INTENSITY
     run_tag = f"{int(time.time())}_{os.getpid()}"
     log_directory = f"/tmp/logs/carbontracker/{run_tag}"
     os.makedirs(log_directory, exist_ok=True)
@@ -281,6 +368,12 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         except json.JSONDecodeError:
             print("[WARN] In carbon node extra_data JSON is not valid.")
             user_extra = {}
+
+    # Grid intensity of the deployment country (see _grid_intensity for the fallbacks)
+    geo = _grid_intensity(user_input.geo_location_region())
+    if geo is not None:
+        output_extra_data["grid_ci_source"] = f"{geo[1]} ({geo[2]}), {geo[3]}"
+        print(f"[INFO][carbon] Using grid intensity of {geo[1]} ({geo[2]}, {geo[3]}): {geo[0]} gCO2/kWh")
 
     if "num_outputs" in user_extra and user_extra["num_outputs"] != "":
         output_extra_data["num_outputs"] = user_extra["num_outputs"]
@@ -311,52 +404,41 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
         return
 
+    # The intensities come only from carbon_intensities.csv (shipped with this node): without it
+    # there is no correct intensity to use, so report it instead of using an outdated value
+    if geo is None:
+        print("[ERROR][carbon] carbon_intensities.csv could not be read: carbon footprint not computed.")
+        co2.carbon_footprint(0.0)
+        co2.energy_consumption(0.0)
+        co2.carbon_intensity(0.0)
+        output_extra_data.update({
+            "mode": "error",
+            "error": "Carbon intensity table (carbon_intensities.csv) could not be read. Carbon footprint not computed.",
+            "auto_reiterate": False
+        })
+        co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
+        return
+
     # ONNX path (FPGA / RPTU) → use HW latency & power only
     model_path = ml_model.model_path()
     is_onnx = isinstance(model_path, str) and model_path.endswith(".onnx")
 
     if is_onnx:
 
-        # Calibrate GRID_CARBON_INTENSITY if not set
-        if (not os.getenv("SUSTAINML_GRID_CI")) and (not GRID_CARBON_INTENSITY or GRID_CARBON_INTENSITY <= 0):
-            try:
-                run_tag = f"ci_calib_{int(time.time())}_{os.getpid()}"
-                calib_log_dir = f"/tmp/logs/carbontracker/{run_tag}"
-                os.makedirs(calib_log_dir, exist_ok=True)
-
-                tracker = CarbonTracker(log_dir=calib_log_dir, epochs=1)
-                tracker.epoch_start()
-
-                t0 = time.time()
-                while time.time() - t0 < 0.5:
-                    _ = (torch.rand(256, 256) @ torch.rand(256, 256)).sum().item()
-
-                tracker.epoch_end()
-                tracker.stop()
-                time.sleep(0.2)
-
-                _, _, ci = _parse_tracker_logs(calib_log_dir)
-                if ci is not None and ci > 0:
-                    GRID_CARBON_INTENSITY = float(ci)
-                else:
-                    # Fallback if calibration didn't yield a CI
-                    GRID_CARBON_INTENSITY = 0.0
-            except Exception as e:
-                print(f"[WARN] CI calibration failed; using fallback. Reason: {e}")
-                GRID_CARBON_INTENSITY = 0.0
-
         raw_latency = float(hw.latency())            # h
         raw_power   = float(hw.power_consumption())  # W
 
         energy_kwh = (raw_power * raw_latency) / 1000.0
-        carbon_g   = energy_kwh * GRID_CARBON_INTENSITY
+        grid_ci    = geo[0]
+        carbon_g   = energy_kwh * grid_ci
+        print(f"[INFO][carbon] Carbon footprint: {energy_kwh:.6g} kWh x {grid_ci} gCO2/kWh ({geo[1]}) = {carbon_g:.6g} gCO2e")
 
         co2.carbon_footprint(carbon_g)
         co2.energy_consumption(energy_kwh)
-        co2.carbon_intensity(GRID_CARBON_INTENSITY)
+        co2.carbon_intensity(grid_ci)
 
         output_extra_data["mode"] = "onnx_hw_only"
-        output_extra_data["grid_ci_source"] = "env" if os.getenv("SUSTAINML_GRID_CI") else "calibrated_or_fallback"
+        output_extra_data["auto_reiterate"] = _auto_reiterate(user_input, user_extra, hw, carbon_g)
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
         return
 
@@ -380,7 +462,7 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         queue = multiprocessing.Queue()
         proc = multiprocessing.Process(
             target=create_tracker,
-            args=(log_directory, 1, queue, ml_model, unsupported_models)
+            args=(log_directory, 1, queue, ml_model, unsupported_models, geo)
         )
         proc.start()
         proc.join(timeout=75)
@@ -399,7 +481,7 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
                     raise Exception("Error creating tracker: " + str(result))
                 else:
                     print("Tracker created successfully.")
-                    carbon = float(result or 0.0)
+                    measured_s = float(result)
 
                     # Try to get energy from tracker logs
                     tracker_energy_kwh = None
@@ -409,52 +491,34 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
                     except Exception as e:
                         print("Could not re-parse tracker logs in task_callback:", e)
 
-                    try:
-                        latency_h = float(hw.latency())
-                        power_w   = float(hw.power_consumption())   # W
-
-                        # W * h = Wh → /1000 = kWh
-                        energy_consump_hw_kwh = (power_w * latency_h) / 1000.0
-                    except Exception as e:
-                        print("HW energy compute failed:", e)
-                        energy_consump_hw_kwh = 0.0
-
-                    # Choose energy source
-                    if tracker_energy_kwh is not None and tracker_energy_kwh > 0:
-                        energy_consump = tracker_energy_kwh
+                    latency_h = float(hw.latency())        # hours per inference
+                    latency_s = latency_h * 3600.0
+                    if tracker_energy_kwh is not None and tracker_energy_kwh > 0 and measured_s > 0 and latency_s > 0:
+                        # Energy measured while running measured_s seconds: per inference, given
+                        # one inference takes latency_s
+                        energy_consump = tracker_energy_kwh / (measured_s / latency_s)
                     else:
-                        energy_consump = energy_consump_hw_kwh
-
-                    # Scale to per-inference
-                    try:
-                        epoch_s = float(os.getenv("CT_TARGET_SECONDS", "1.0"))
-                        latency_h = float(hw.latency())        # hours per inference
-                        latency_s = latency_h * 3600.0         # convert to seconds
-
-                        if epoch_s > 0.0 and latency_s > 0.0:
-                            inf_per_epoch = epoch_s / latency_s
-                            if inf_per_epoch > 0.0:
-                                carbon = carbon / inf_per_epoch
-                                energy_consump = energy_consump / inf_per_epoch
-                            else:
-                                print("inf_per_epoch <= 0, skipping per-inference scaling")
-                        else:
-                            print("epoch_s or latency_s <= 0, skipping per-inference scaling")
-                    except Exception as e:
-                        print("Per-inference scaling failed:", e)
+                        # Nothing measured: the HW energy of one inference (W * h / 1000 = kWh)
+                        energy_consump = float(hw.power_consumption()) * latency_h / 1000.0
             else:
                 raise Exception("No result obtained from the tracker process; failed to obtain carbon footprint value.")
 
+        # Energy is measured here, emissions depend on where the model will be deployed. With no
+        # energy measured, intensity 0 marks the result as failed
         intensity = 0.0
+        carbon = 0.0
         if energy_consump > 0:
-            intensity = carbon / energy_consump
-            GRID_CARBON_INTENSITY = intensity  # Update global
+            intensity = geo[0]
+            carbon = energy_consump * intensity
+            print(f"[INFO][carbon] Carbon footprint: {energy_consump:.6g} kWh x {intensity} gCO2/kWh ({geo[1]}) = {carbon:.6g} gCO2e")
 
         co2.carbon_footprint(carbon)
         co2.energy_consumption(energy_consump)
         co2.carbon_intensity(intensity)
 
         output_extra_data["mode"] = "tracker"
+        output_extra_data["auto_reiterate"] = _auto_reiterate(user_input, user_extra, hw,
+                                                              carbon if energy_consump > 0 else None)
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
 
     except Exception as e:
@@ -465,7 +529,8 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
 
         output_extra_data.update({
             "mode": "error",
-            "error": f"Failed to obtain carbon footprint information: {e}"
+            "error": f"Failed to obtain carbon footprint information: {e}",
+            "auto_reiterate": _auto_reiterate(user_input, user_extra, hw, None)
         })
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
 
