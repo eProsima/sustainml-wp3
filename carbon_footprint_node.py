@@ -423,7 +423,16 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     model_path = ml_model.model_path()
     is_onnx = isinstance(model_path, str) and model_path.endswith(".onnx")
 
-    if is_onnx:
+    # YOLO models on the Axelera board: their latency and power were measured on the board, and
+    # there is no model here to run, so the same HW-only path applies
+    is_axelera = False
+    try:
+        hw_extra = bytes(hw.extra_data() or b"").decode("utf-8")
+        is_axelera = bool(hw_extra) and "axelera" in json.loads(hw_extra)
+    except Exception:
+        pass
+
+    if is_onnx or is_axelera:
 
         raw_latency = float(hw.latency())            # h
         raw_power   = float(hw.power_consumption())  # W
@@ -437,7 +446,7 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         co2.energy_consumption(energy_kwh)
         co2.carbon_intensity(grid_ci)
 
-        output_extra_data["mode"] = "onnx_hw_only"
+        output_extra_data["mode"] = "axelera_measured" if is_axelera else "onnx_hw_only"
         output_extra_data["auto_reiterate"] = _auto_reiterate(user_input, user_extra, hw, carbon_g)
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
         return
