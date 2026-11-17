@@ -419,12 +419,15 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
         return
 
-    # ONNX path (FPGA / RPTU) → use HW latency & power only
+    # The energy of one inference is the same for every model and hardware: the power the HW
+    # resources node gives for the model on the selected hardware x its latency. That power is
+    # the model's own, without the hardware's idle power: measured on the Axelera board, from
+    # DFKI's predictor on the FPGA, from the UPMEM simulator for Hugging Face models
     model_path = ml_model.model_path()
     is_onnx = isinstance(model_path, str) and model_path.endswith(".onnx")
 
     # YOLO models on the Axelera board: their latency and power were measured on the board, and
-    # there is no model here to run, so the same HW-only path applies
+    # there is no model here to run
     is_axelera = False
     try:
         hw_extra = bytes(hw.extra_data() or b"").decode("utf-8")
@@ -432,12 +435,30 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
     except Exception:
         pass
 
-    if is_onnx or is_axelera:
+    raw_latency = float(hw.latency())            # h
+    raw_power   = float(hw.power_consumption())  # W
+    energy_kwh  = (raw_power * raw_latency) / 1000.0
 
-        raw_latency = float(hw.latency())            # h
-        raw_power   = float(hw.power_consumption())  # W
+    # No latency: the HW resources node could not evaluate the model, so there is no inference to
+    # give an energy to, not even with CarbonTracker (its energy is per inference through the
+    # latency)
+    if raw_latency <= 0:
+        print("[ERROR][carbon] No latency from the HW resources node: carbon footprint not computed.")
+        co2.carbon_footprint(0.0)
+        co2.energy_consumption(0.0)
+        co2.carbon_intensity(0.0)
+        output_extra_data.update({
+            "mode": "error",
+            "error": "The hardware resources of the model could not be computed. Carbon footprint not computed.",
+            "auto_reiterate": _auto_reiterate(user_input, user_extra, hw, None)
+        })
+        co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
+        return
 
-        energy_kwh = (raw_power * raw_latency) / 1000.0
+    # ONNX models (FPGA / RPTU) and the Axelera board have no other source; a Hugging Face model
+    # uses CarbonTracker below only when the HW resources node gave it no energy
+    if is_onnx or is_axelera or energy_kwh > 0:
+
         grid_ci    = geo[0]
         carbon_g   = energy_kwh * grid_ci
         print(f"[INFO][carbon] Carbon footprint: {energy_kwh:.6g} kWh x {grid_ci} gCO2/kWh ({geo[1]}) = {carbon_g:.6g} gCO2e")
@@ -446,12 +467,18 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         co2.energy_consumption(energy_kwh)
         co2.carbon_intensity(grid_ci)
 
-        output_extra_data["mode"] = "axelera_measured" if is_axelera else "onnx_hw_only"
+        output_extra_data["mode"] = ("axelera_measured" if is_axelera else "onnx_hw_only" if is_onnx
+                                     else "hw_simulated")
         output_extra_data["auto_reiterate"] = _auto_reiterate(user_input, user_extra, hw, carbon_g)
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
         return
 
-    # HF / CarbonTracker path (non-ONNX models)
+    # Fallback for a Hugging Face model without energy from the HW resources node: CarbonTracker
+    # measures this PC running the model, not the selected hardware, and includes this PC's idle
+    # power and CarbonTracker's data-centre factor (PUE), so its result is not comparable with
+    # the others. The mode "tracker" marks it
+    print("[WARN][carbon] No energy from the HW resources node: using CarbonTracker on this PC "
+          "(not comparable with the other results)")
     unsupported_models = None
     extra_data_bytes = ml_model.extra_data()
     if extra_data_bytes:
@@ -500,15 +527,12 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
                     except Exception as e:
                         print("Could not re-parse tracker logs in task_callback:", e)
 
-                    latency_h = float(hw.latency())        # hours per inference
-                    latency_s = latency_h * 3600.0
+                    latency_s = raw_latency * 3600.0
+                    energy_consump = 0.0
                     if tracker_energy_kwh is not None and tracker_energy_kwh > 0 and measured_s > 0 and latency_s > 0:
                         # Energy measured while running measured_s seconds: per inference, given
                         # one inference takes latency_s
                         energy_consump = tracker_energy_kwh / (measured_s / latency_s)
-                    else:
-                        # Nothing measured: the HW energy of one inference (W * h / 1000 = kWh)
-                        energy_consump = float(hw.power_consumption()) * latency_h / 1000.0
             else:
                 raise Exception("No result obtained from the tracker process; failed to obtain carbon footprint value.")
 
