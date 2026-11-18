@@ -455,7 +455,7 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
         return
 
-    # ONNX models (FPGA / RPTU) and the Axelera board have no other source; a Hugging Face model
+    # ONNX models (FPGA) and the Axelera board have no other source; a Hugging Face model
     # uses CarbonTracker below only when the HW resources node gave it no energy
     if is_onnx or is_axelera or energy_kwh > 0:
 
