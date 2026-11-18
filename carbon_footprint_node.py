@@ -112,7 +112,7 @@ def _parse_tracker_logs(log_dir):
 
     try:
         logs = parser.parse_all_logs(log_dir=log_dir)
-    except Exception as e:
+    except Exception:
         return carbon_g, energy_kwh, ci_g_per_kwh
 
     if not logs:
@@ -297,7 +297,6 @@ def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=Non
         for epoch in range(epochs):
             tracker.epoch_start()
             start = time.time()
-            iters = 0
             with torch.inference_mode():
                 while (time.time() - start) < target_s:
                     try:
@@ -307,7 +306,6 @@ def create_tracker(log_dir, epochs, queue, ml_model=None, unsupported_models=Non
                         if "decoder_input_ids" not in input and "input_ids" in input:
                             input["decoder_input_ids"] = input["input_ids"]
                         model(**input)
-                    iters += 1
             elapsed = time.time() - start
             tracker.epoch_end()
 
@@ -455,7 +453,7 @@ def task_callback(ml_model, user_input, hw, node_status, co2):
         co2.extra_data(json.dumps(output_extra_data).encode("utf-8"))
         return
 
-    # ONNX models (FPGA / RPTU) and the Axelera board have no other source; a Hugging Face model
+    # ONNX models (FPGA) and the Axelera board have no other source; a Hugging Face model
     # uses CarbonTracker below only when the HW resources node gave it no energy
     if is_onnx or is_axelera or energy_kwh > 0:
 
