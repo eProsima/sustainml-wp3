@@ -575,6 +575,24 @@ def configuration_callback(req, res):
 
     # Callback for configuration implementation here
 
+    # Grid carbon intensity of every country of carbon_intensities.csv, by ISO alpha-2 code, for
+    # the screens of the UI that turn energy into CO2 for a chosen country
+    if req.configuration() == "carbon_intensities":
+        res.node_id(req.node_id())
+        res.transaction_id(req.transaction_id())
+        _country_intensity("")  # Loads the table
+        if COUNTRY_INTENSITIES:
+            intensities = {code: {"country": entity, "year": year, "g_per_kwh": value}
+                           for code, (value, entity, year) in COUNTRY_INTENSITIES.items()}
+            res.configuration(json.dumps({"carbon_intensities": intensities}))
+            res.success(True)
+            res.err_code(0)  # 0: No error || 1: Error
+        else:
+            res.configuration(json.dumps({"error": "carbon_intensities.csv could not be read"}))
+            res.success(False)
+            res.err_code(1)  # 0: No error || 1: Error
+        return
+
     # Case not supported
     res.node_id(req.node_id())
     res.transaction_id(req.transaction_id())
